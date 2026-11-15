@@ -6,11 +6,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import json
+import os
 import sys
+import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
+
+from candidates import DEFAULT_SUFFIXES, combinations, mask_space, skip_candidates, variations
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,15 @@ class Result:
     password: str | None
     tested: int
     skipped: int
+
+
+@dataclass
+class SearchState:
+    position: int = 0
+    tested: int = 0
+    skipped: int = 0
+    elapsed: float = 0.0
+    status: str = "running"
 
 
 def derive_pmk(password: str, ssid: bytes) -> bytes:
@@ -72,7 +86,8 @@ def parse_record(line: str) -> Record:
 
 def load_records(path: Path, ssid_filter: str | None = None) -> list[Record]:
     records = []
-    for number, line in enumerate(path.read_text(encoding="ascii").splitlines(), 1):
+    # UTF-8 com BOM é comum em arquivos salvos por editores no Windows.
+    for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -95,29 +110,141 @@ def wordlist_lines(path: Path) -> Iterable[bytes]:
             yield line.rstrip(b"\r\n")
 
 
+def match_password(records: list[Record], raw: bytes) -> Record | None:
+    password = raw.decode("ascii")
+    keys: dict[bytes, bytes] = {}
+    for record in records:
+        if record.ssid not in keys:
+            keys[record.ssid] = derive_pmk(password, record.ssid)
+        actual = calculate_pmkid(keys[record.ssid], record.ap, record.station)
+        if hmac.compare_digest(actual, record.pmkid):
+            return record
+    return None
+
+
+def valid_password(raw: bytes) -> bool:
+    return 8 <= len(raw) <= 63 and all(32 <= c <= 126 for c in raw)
+
+
 def crack(records: list[Record], candidates: Iterable[bytes]) -> Result:
     if not records:
         raise ValueError("é necessário ao menos um registro")
     tested = skipped = 0
     for raw in candidates:
-        if not 8 <= len(raw) <= 63 or any(c < 32 or c > 126 for c in raw):
+        if not valid_password(raw):
             skipped += 1
             continue
-        password = raw.decode("ascii")
         tested += 1
-        # Um PBKDF2 por SSID e candidato, mesmo com múltiplos registros da rede.
-        keys: dict[bytes, bytes] = {}
-        for record in records:
-            if record.ssid not in keys:
-                keys[record.ssid] = derive_pmk(password, record.ssid)
-            actual = calculate_pmkid(keys[record.ssid], record.ap, record.station)
-            if hmac.compare_digest(actual, record.pmkid):
-                return Result(record, password, tested, skipped)
+        record = match_password(records, raw)
+        if record is not None:
+            return Result(record, raw.decode("ascii"), tested, skipped)
     return Result(None, None, tested, skipped)
 
 
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def session_identity(args) -> str:
+    settings = {"version": 1, "mode": args.command, "capture": file_digest(args.capture), "ssid": args.ssid}
+    if args.command == "crack":
+        settings.update(wordlist=file_digest(args.wordlist), variations=args.variations, suffixes=args.suffix)
+    else:
+        settings.update(charset=args.charset, minimum=args.min_length, maximum=args.max_length,
+                        prefix=args.prefix, suffix=args.suffix)
+    return hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+
+
+def save_session(path: Path, identity: str, state: SearchState):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Arquivo temporário com permissão privada e troca atômica; não salva senhas.
+    descriptor, name = tempfile.mkstemp(prefix=".wifi-session-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump({"version": 1, "identity": identity, "state": asdict(state)}, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def load_session(path: Path, identity: str) -> SearchState:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data["version"] != 1 or data["identity"] != identity:
+            raise ValueError("arquivos ou parâmetros diferentes dos usados na sessão")
+        state = SearchState(**data["state"])
+        counts = (state.position, state.tested, state.skipped)
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise ValueError("contadores inválidos na sessão")
+        if state.position != state.tested + state.skipped:
+            raise ValueError("contadores inconsistentes na sessão")
+        if not isinstance(state.elapsed, (int, float)) or not 0 <= state.elapsed < float("inf"):
+            raise ValueError("tempo inválido na sessão")
+        if state.status not in ("running", "paused", "interrupted"):
+            raise ValueError("sessão concluída; inicie outra busca sem --resume")
+        return state
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError("arquivo de sessão inválido") from exc
+
+
+def run_search(records, candidates, state, limit, session=None, identity=""):
+    started = last_update = time.perf_counter()
+    previous_elapsed = state.elapsed
+    processed = 0
+    state.status = "running"
+    last_counts = (state.position, state.tested, state.skipped)
+
+    def checkpoint():
+        state.elapsed = previous_elapsed + time.perf_counter() - started
+        if session is not None:
+            save_session(session, identity, state)
+
+    checkpoint()
+    try:
+        for raw in candidates:
+            if processed >= limit:
+                state.status = "paused"
+                break
+            last_counts = (state.position, state.tested, state.skipped)
+            valid = valid_password(raw)
+            # Só avança depois de concluir a verificação; Ctrl+C não perde uma candidata.
+            record = match_password(records, raw) if valid else None
+            state.position += 1
+            state.tested += int(valid)
+            state.skipped += int(not valid)
+            processed += 1
+            if record is not None:
+                state.status = "found"
+                return Result(record, raw.decode("ascii"), state.tested, state.skipped)
+            now = time.perf_counter()
+            if now - last_update >= 5:
+                checkpoint()
+                rate = state.tested / state.elapsed if state.elapsed else 0
+                print(f"Progresso: {state.position} candidatas processadas; {rate:.1f} testes/s.",
+                      file=sys.stderr, flush=True)
+                last_update = now
+        else:
+            state.status = "exhausted"
+        return Result(None, None, state.tested, state.skipped)
+    except KeyboardInterrupt:
+        # Repetir uma candidata é preferível a perdê-la se o sinal chegar entre
+        # a comparação, a atualização dos contadores e a exibição do resultado.
+        state.position, state.tested, state.skipped = last_counts
+        state.status = "interrupted"
+        raise
+    finally:
+        checkpoint()
+
+
 def report(result: Result, elapsed: float) -> int:
-    print(f"Candidatos testados: {result.tested}; linhas ignoradas: {result.skipped}.")
+    print(f"Candidatos testados: {result.tested}; candidatas inválidas ignoradas: {result.skipped}.")
     print(f"Tempo: {elapsed:.3f} s.")
     if result.record is None:
         print("Nenhuma correspondência. Isso não comprova que a senha seja forte.")
@@ -134,25 +261,76 @@ def main(argv: list[str] | None = None) -> int:
         description="Teste de dicionário offline de PMKID WPA2-Personal em redes autorizadas."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("demo", help="executa um exemplo sintético, sem usar a rede")
+    demo = subparsers.add_parser("demo", help="executa um exemplo sintético, sem usar a rede")
+    demo.add_argument("--variations", action="store_true", help="encontra uma senha ausente da lista original")
     search = subparsers.add_parser("crack", help="testa uma lista local contra PMKID(s)")
     search.add_argument("capture", type=Path, help="arquivo de texto .22000 com registros WPA*01")
     search.add_argument("wordlist", type=Path, help="arquivo local: uma senha por linha")
-    search.add_argument("--ssid", help="filtra o SSID pelo nome UTF-8 exato")
+    search.add_argument("--variations", action="store_true", help="gera variações de caixa, substituições e sufixos")
+    search.add_argument("--suffix", action="append", help="sufixo das variações; repetível; substitui os padrões")
+    brute = subparsers.add_parser("brute", help="testa combinações de um alfabeto e intervalo definidos")
+    brute.add_argument("capture", type=Path)
+    brute.add_argument("--charset", required=True, help="caracteres permitidos na parte variável")
+    brute.add_argument("--min-length", required=True, type=int, help="tamanho mínimo da parte variável")
+    brute.add_argument("--max-length", required=True, type=int, help="tamanho máximo da parte variável")
+    brute.add_argument("--prefix", default="", help="texto fixo antes da parte variável")
+    brute.add_argument("--suffix", default="", help="texto fixo depois da parte variável")
+    for command in (search, brute):
+        command.add_argument("--ssid", help="filtra o SSID pelo nome UTF-8 exato")
+        command.add_argument("--limit", type=int, default=100000, help="máximo de candidatas por execução (padrão: 100000)")
+        command.add_argument("--session", type=Path, help="arquivo de progresso para retomada")
+        command.add_argument("--resume", action="store_true", help="retoma --session com os mesmos parâmetros")
     args = parser.parse_args(argv)
     try:
         if args.command == "demo":
             examples = Path(__file__).resolve().parent / "examples"
             records = load_records(examples / "aula.22000")
-            words = wordlist_lines(examples / "senhas.txt")
+            words = wordlist_lines(examples / ("palavras.txt" if args.variations else "senhas.txt"))
+            if args.variations:
+                words = variations(words)
             print("Demonstração sintética: rede fictícia Aula-WiFi, senha conhecida Aula2026!.")
+            print(f"Registros carregados: {len(records)}.")
+            started = time.perf_counter()
+            return report(crack(records, words), time.perf_counter() - started)
         else:
+            if args.limit < 1:
+                raise ValueError("--limit deve ser maior que zero")
+            if args.resume and args.session is None:
+                raise ValueError("--resume exige --session")
+            if args.session and args.session.exists() and not args.resume:
+                raise ValueError("a sessão já existe; use --resume ou escolha outro arquivo")
             records = load_records(args.capture, args.ssid)
-            words = wordlist_lines(args.wordlist)
+            if args.command == "crack":
+                if args.suffix and not args.variations:
+                    raise ValueError("--suffix exige --variations no modo crack")
+                if args.suffix:
+                    for suffix in args.suffix:
+                        if any(ord(c) < 32 or ord(c) > 126 for c in suffix):
+                            raise ValueError("sufixos devem usar ASCII imprimível")
+                # Abre antes de criar a sessão para detectar arquivo ausente.
+                with args.wordlist.open("rb"):
+                    pass
+            else:
+                total = mask_space(args.charset, args.min_length, args.max_length, args.prefix, args.suffix)
+                print(f"Espaço de busca: {total} combinações. Limite desta execução: {args.limit}.")
+            identity = session_identity(args) if args.session else ""
+            state = load_session(args.session, identity) if args.resume else SearchState()
+            if args.command == "crack":
+                words = wordlist_lines(args.wordlist)
+                if args.variations:
+                    words = variations(words, args.suffix if args.suffix is not None else DEFAULT_SUFFIXES)
+                words = skip_candidates(words, state.position)
+            else:
+                words = combinations(args.charset, args.min_length, args.max_length,
+                                     args.prefix, args.suffix, state.position)
         print(f"Registros carregados: {len(records)}. A busca termina na primeira correspondência.")
-        started = time.perf_counter()
-        result = crack(records, words)
-        return report(result, time.perf_counter() - started)
+        result = run_search(records, words, state, args.limit, args.session, identity)
+        if state.status == "paused":
+            print(f"Busca parcial: limite atingido após {state.position} candidatas; {state.tested} testadas e {state.skipped} ignoradas.")
+            print("Use os mesmos parâmetros com --resume para continuar." if args.session else
+                  "Use --session para poder retomar; esta execução não salvou o progresso.")
+            return 3
+        return report(result, state.elapsed)
     except (OSError, ValueError) as exc:
         print(f"Erro: {exc}", file=sys.stderr)
         return 2

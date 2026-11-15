@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 # Evite versionar capturas e senhas reais. Os exemplos são fictícios.
 private/
+*.session.json
