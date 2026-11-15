@@ -32,6 +32,49 @@ funcionamento do exemplo; não garante descobrir a senha de qualquer rede.
 
 Para atualizar uma cópia já baixada, execute `git pull` dentro da pasta do projeto.
 
+## De onde vem o registro PMKID (e por que capturar é difícil)
+
+Esta ferramenta **não captura** nada: ela só testa um registro que você já
+obteve. Capturar um PMKID exige hardware de rádio em **modo monitor** com
+injeção — e isso tem limites físicos que nenhum código contorna:
+
+- **Em nuvem / máquina virtual:** não há placa Wi-Fi, então não há captura.
+- **Wireshark sozinho:** é um analisador passivo; só mostra o que a placa já
+  entrega. Sem modo monitor ele não vê os quadros EAPOL, e o PMKID normalmente
+  só aparece quando algo provoca o roteador a respondê-lo.
+- **Celular comum:** não faz modo monitor. No Android depende de *root* +
+  chipset específico (ou adaptador USB externo via OTG); no iPhone não é possível.
+
+A captura real, **na sua própria rede autorizada**, costuma usar um Linux com um
+adaptador compatível e as ferramentas `hcxdumptool` (coleta) e `hcxpcapngtool`
+(conversão para o texto `.22000`). Sem esse hardware, use o gerador abaixo para
+produzir dados de laboratório e praticar o fluxo completo de teste.
+
+## Gerar um registro de laboratório (sem captura)
+
+Quando você **já conhece** a senha de uma rede de laboratório, o comando `gerar`
+monta um registro `.22000` autêntico a partir do SSID e da senha. É a forma de
+ter dados de aula sem placa Wi-Fi: o registro resultante é matematicamente igual
+ao que seria capturado, e serve para demonstrar `crack` e `brute` de ponta a ponta.
+
+```bash
+python3 wifi_lab.py gerar --ssid "Aula-WiFi" --senha "Aula2026!"
+```
+
+Os MACs do roteador e do cliente são aleatórios por padrão; fixe-os com `--ap` e
+`--cliente` (aceitam `aa:bb:cc:dd:ee:ff`, `aa-bb-...` ou 12 dígitos corridos).
+Para gravar direto num arquivo e já usar no teste:
+
+```bash
+mkdir -p private
+python3 wifi_lab.py gerar --ssid "Aula-WiFi" --senha "Aula2026!" --saida private/lab.22000
+python3 wifi_lab.py crack private/lab.22000 examples/senhas.txt
+```
+
+O registro só é compatível com a senha informada: se ela não estiver (ou não for
+gerada) na lista testada, o `crack` termina sem correspondência, exatamente como
+em um registro capturado de verdade.
+
 ## Testar um registro da própria rede
 
 Forneça um registro PMKID já obtido no laboratório autorizado, exportado no

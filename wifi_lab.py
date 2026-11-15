@@ -67,6 +67,22 @@ def hex_bytes(value: str, label: str, size: int | None = None) -> bytes:
     return decoded
 
 
+def parse_mac(value: str, label: str) -> bytes:
+    # Aceita aa:bb:cc:dd:ee:ff, aa-bb-... ou 12 dígitos corridos.
+    cleaned = value.replace(":", "").replace("-", "").strip()
+    return hex_bytes(cleaned, label, 6)
+
+
+def format_record(ssid: str, password: str, ap: bytes, station: bytes) -> str:
+    """Monta um registro WPA*01 de laboratório a partir de uma senha conhecida."""
+    ssid_bytes = ssid.encode("utf-8")
+    pmk = derive_pmk(password, ssid_bytes)  # valida a senha e o tamanho do SSID
+    pmkid = calculate_pmkid(pmk, ap, station)
+    if pmkid == bytes(16):
+        raise ValueError("PMKID resultou em zeros; troque os MACs")
+    return f"WPA*01*{pmkid.hex()}*{ap.hex()}*{station.hex()}*{ssid_bytes.hex()}***"
+
+
 def parse_record(line: str) -> Record:
     fields = line.split("*")
     if fields[:2] == ["WPA", "02"]:
@@ -263,6 +279,12 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     demo = subparsers.add_parser("demo", help="executa um exemplo sintético, sem usar a rede")
     demo.add_argument("--variations", action="store_true", help="encontra uma senha ausente da lista original")
+    gen = subparsers.add_parser("gerar", help="cria um registro .22000 de laboratório a partir de SSID e senha conhecidos")
+    gen.add_argument("--ssid", required=True, help="nome da rede de laboratório (UTF-8)")
+    gen.add_argument("--senha", required=True, help="frase-senha conhecida dessa rede (8 a 63 caracteres)")
+    gen.add_argument("--ap", help="MAC do roteador em hexadecimal; padrão: aleatório")
+    gen.add_argument("--cliente", help="MAC do cliente em hexadecimal; padrão: aleatório")
+    gen.add_argument("--saida", type=Path, help="arquivo .22000 de destino (anexa ao final); padrão: imprime na tela")
     search = subparsers.add_parser("crack", help="testa uma lista local contra PMKID(s)")
     search.add_argument("capture", type=Path, help="arquivo de texto .22000 com registros WPA*01")
     search.add_argument("wordlist", type=Path, help="arquivo local: uma senha por linha")
@@ -292,6 +314,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Registros carregados: {len(records)}.")
             started = time.perf_counter()
             return report(crack(records, words), time.perf_counter() - started)
+        elif args.command == "gerar":
+            ap = parse_mac(args.ap, "MAC do AP") if args.ap else os.urandom(6)
+            station = parse_mac(args.cliente, "MAC do cliente") if args.cliente else os.urandom(6)
+            line = format_record(args.ssid, args.senha, ap, station)
+            if args.saida:
+                with args.saida.open("a", encoding="utf-8") as stream:
+                    stream.write(line + "\n")
+                print(f"Registro de laboratório anexado em {args.saida}.", file=sys.stderr)
+                print("Use-o com: python3 wifi_lab.py crack <este_arquivo> <sua_lista.txt>", file=sys.stderr)
+            else:
+                print(line)
+            return 0
         else:
             if args.limit < 1:
                 raise ValueError("--limit deve ser maior que zero")

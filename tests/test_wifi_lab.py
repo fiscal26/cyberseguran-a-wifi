@@ -12,7 +12,9 @@ from wifi_lab import (  # noqa: E402
     calculate_pmkid,
     crack,
     derive_pmk,
+    format_record,
     load_records,
+    parse_mac,
     parse_record,
     wordlist_lines,
 )
@@ -121,6 +123,26 @@ class CLITests(unittest.TestCase):
             result = self.run_cli("crack", Path(directory) / "missing.22000", path)
             self.assertEqual(result.returncode, 2)
             self.assertIn("Erro:", result.stderr)
+
+
+class GeneratorTests(unittest.TestCase):
+    def test_generated_record_is_crackable(self):
+        ap = parse_mac("aa:bb:cc:11:22:33", "ap")
+        station = parse_mac("44-55-66-77-88-99", "cliente")
+        line = format_record("Casa-do-Prof", "Segredo123!", ap, station)
+        record = parse_record(line)
+        self.assertEqual(record.ssid, b"Casa-do-Prof")
+        self.assertIsNotNone(crack([record], iter([b"Segredo123!"])).record)
+        self.assertIsNone(crack([record], iter([b"senhaerrada1"])).record)
+
+    def test_generator_rejects_bad_input(self):
+        ap = station = bytes(6)
+        for ssid, password in [("x", "curta"), ("", "Aula2026!"), ("a" * 33, "Aula2026!")]:
+            with self.subTest(ssid=ssid), self.assertRaises(ValueError):
+                format_record(ssid, password, ap, station)
+        for value in ["zzz", "aabb", "aabbccddee-f"]:
+            with self.subTest(mac=value), self.assertRaises(ValueError):
+                parse_mac(value, "mac")
 
 
 if __name__ == "__main__":
