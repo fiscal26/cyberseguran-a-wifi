@@ -1,9 +1,83 @@
 # Wi-Fi Lab — laboratório de senhas WPA2
 
-Ferramenta de linha de comando em português para demonstrar testes de dicionário, variações e combinações
-**offline** contra PMKID de WPA2-Personal (PSK). Use nos testes das redes de vocês
-ou com autorização do responsável. Requer Python 3.10 ou superior; não precisa
-de bibliotecas extras, internet, placa Wi-Fi ou privilégios de administrador.
+Ferramenta de linha de comando em português para testes de dicionário, variações
+e combinações em redes WPA2-Personal (PSK). Inclui análise **offline** de PMKID e
+um modo experimental de conexões temporárias no **Windows**, sem captura.
+Use nos testes das redes de vocês ou com autorização do responsável.
+Requer Python 3.10 ou superior, sem bibliotecas extras. O modo offline dispensa
+internet, placa Wi-Fi e privilégios de administrador.
+
+## Windows: testar sem senha salva, captura ou modo monitor
+
+O comando `windows` usa a API Native Wi-Fi do próprio Windows para tentar conectar
+à rede informada com uma candidata de cada vez. Requer um adaptador Wi-Fi
+funcionando em modo normal (`managed`). Não requer PMKID, Wireshark, Npcap, senha
+previamente salva ou ferramentas externas. A rede precisa aceitar **WPA2-Personal
+com AES/CCMP**; WPA3-only, Enterprise, WEP e redes abertas não são suportadas.
+
+**Estado de validação:** os testes automatizados do gerador, XML, fluxo de
+tentativas, confirmação e limpeza usam uma API Wi-Fi simulada em Linux. A chamada
+nativa ainda precisa ser validada em Windows com hardware real. Não trate esse
+modo como uma implementação já homologada para seu adaptador.
+
+Dentro da pasta do projeto, execute no PowerShell:
+
+```powershell
+git pull
+New-Item -ItemType Directory -Force private | Out-Null
+notepad private\palavras.txt
+```
+
+Escreva uma palavra candidata por linha e salve o arquivo. Não é necessário saber
+a senha correta, mas ela precisa ser uma das candidatas ou resultar das variações
+geradas. Para começar o teste na rede de vocês:
+
+```powershell
+py wifi_lab.py windows --ssid "NOME_EXATO_DA_REDE" --wordlist private\palavras.txt --variations --limit 10
+```
+
+Por padrão, cada tentativa aguarda até 15 segundos e cada execução faz no máximo
+10 tentativas válidas. `--timeout` aceita de 5 a 60 segundos e `--limit` de 1 a 1000.
+Um prazo maior pode ser necessário para associação, autenticação ou sinal fraco.
+Não há paralelismo entre tentativas. Para gerar combinações sem um dicionário,
+informe um alfabeto, os tamanhos da parte variável e, opcionalmente, prefixo/sufixo:
+
+```powershell
+py wifi_lab.py windows --ssid "Aula-WiFi" --charset "6!" --min-length 2 --max-length 2 --prefix Aula202 --limit 4
+```
+
+Esse exemplo só faz sentido se o laboratório tiver uma rede real WPA2/AES chamada
+`Aula-WiFi`. Diferentemente de `demo`, esse comando realiza conexões de verdade.
+
+O Windows recebe o perfil e a senha em memória por `WlanConnect` no modo
+`temporary_profile`. A ferramenta não chama `WlanSetProfile` nem
+`WlanSaveTemporaryProfile`, não grava XML com a senha, não recupera senhas salvas e
+não remove os perfis existentes. A senha confirmada é exibida no terminal.
+
+**A conexão Wi-Fi atual pode ser interrompida.** Ao terminar ou receber Ctrl+C,
+a ferramenta encerra a conexão temporária e tenta reconectar ao perfil anterior
+quando esse perfil já existia no Windows. Se não houver perfil anterior, o
+adaptador fica desconectado. Encerrar o processo à força ou desligar a máquina
+pode impedir a restauração; reconecte pelo menu Wi-Fi do Windows.
+
+Uma tentativa só é marcada como sucesso quando o Windows informa o SSID esperado,
+o perfil temporário exclusivo dessa tentativa e segurança WPA2-PSK/CCMP.
+Sucesso de autenticação não comprova acesso à internet nem certifica a segurança
+geral da rede. Tempo esgotado também pode significar sinal fraco, rede ausente,
+segurança incompatível ou políticas de acesso, além de senha incorreta.
+
+Se existir mais de um adaptador, o programa lista descrições e GUIDs; selecione
+um usando `--interface "GUID"`. Erros nativos exibem código e mensagem do Windows.
+Permissões de acesso ao Wi-Fi, serviço WLAN AutoConfig e, em versões recentes do
+Windows, permissões de localização podem afetar as consultas à API.
+
+Esse modo não tem retomada por `--session`; cada execução começa na primeira
+candidata. Limite atingido retorna código `3`, lista esgotada sem conexão `1`,
+sucesso `0`, erro `2` e Ctrl+C `130`. Nenhuma combinação finita de palavras ou
+caracteres garante descobrir uma senha arbitrária.
+
+Referências da implementação: [WlanConnect](https://learn.microsoft.com/en-us/windows/win32/api/wlanapi/nf-wlanapi-wlanconnect)
+e [WLAN_CONNECTION_PARAMETERS](https://learn.microsoft.com/en-us/windows/win32/api/wlanapi/ns-wlanapi-wlan_connection_parameters).
 
 ## Baixar e executar a demonstração
 
@@ -171,7 +245,9 @@ execução em CPU, não uma estimativa de resistência a equipamentos especializ
 - Não lê PCAP/PCAPNG nem registros EAPOL `WPA*02`; uma extensão `.22000` sozinha
   não garante que o conteúdo seja compatível.
 - Não testa WPA3-SAE, WPA-Enterprise, WPS ou chaves PSK brutas de 64 dígitos hex.
-- Não faz varredura, captura, desconexão de clientes, nem conexão à rede.
+- Os modos offline não fazem varredura, captura ou conexão à rede. O modo
+  `windows` realiza conexões normais do próprio computador e pode desconectá-lo.
+- A ferramenta não envia comandos de desconexão para outros clientes.
 - Execução sequencial em CPU, adequada a listas pequenas em sala de aula.
 
 Para discutir proteção: prefiram WPA3-Personal quando disponível, desativem WPS,

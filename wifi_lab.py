@@ -275,6 +275,19 @@ def main(argv: list[str] | None = None) -> int:
     brute.add_argument("--max-length", required=True, type=int, help="tamanho máximo da parte variável")
     brute.add_argument("--prefix", default="", help="texto fixo antes da parte variável")
     brute.add_argument("--suffix", default="", help="texto fixo depois da parte variável")
+    windows = subparsers.add_parser("windows", help="experimental: testa conexões WPA2-Personal no Windows, sem captura")
+    windows.add_argument("--ssid", required=True, help="nome exato da rede própria a testar")
+    source = windows.add_mutually_exclusive_group(required=True)
+    source.add_argument("--wordlist", type=Path, help="arquivo local de palavras candidatas")
+    source.add_argument("--charset", help="alfabeto da parte variável, para gerar combinações")
+    windows.add_argument("--variations", action="store_true", help="gera variações do dicionário")
+    windows.add_argument("--min-length", type=int, default=8)
+    windows.add_argument("--max-length", type=int, default=8)
+    windows.add_argument("--prefix", default="")
+    windows.add_argument("--suffix", default="")
+    windows.add_argument("--limit", type=int, default=10, help="máximo de tentativas normais de conexão (padrão: 10)")
+    windows.add_argument("--timeout", type=float, default=15, help="segundos por tentativa (5 a 60)")
+    windows.add_argument("--interface", help="GUID ou descrição do adaptador, caso exista mais de um")
     for command in (search, brute):
         command.add_argument("--ssid", help="filtra o SSID pelo nome UTF-8 exato")
         command.add_argument("--limit", type=int, default=100000, help="máximo de candidatas por execução (padrão: 100000)")
@@ -282,6 +295,23 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--resume", action="store_true", help="retoma --session com os mesmos parâmetros")
     args = parser.parse_args(argv)
     try:
+        if args.command == "windows":
+            from windows_wifi import run_windows
+            if args.wordlist is not None:
+                if args.prefix or args.suffix or args.min_length != 8 or args.max_length != 8:
+                    raise ValueError("prefixo, sufixo e comprimentos exigem --charset no modo windows")
+                with args.wordlist.open("rb"):
+                    pass
+                words = wordlist_lines(args.wordlist)
+                if args.variations:
+                    words = variations(words)
+            else:
+                if args.variations:
+                    raise ValueError("--variations exige --wordlist")
+                total = mask_space(args.charset, args.min_length, args.max_length, args.prefix, args.suffix)
+                print(f"Espaço de busca: {total} combinações; até {args.limit} tentativas nesta execução.")
+                words = combinations(args.charset, args.min_length, args.max_length, args.prefix, args.suffix)
+            return run_windows(args, words)
         if args.command == "demo":
             examples = Path(__file__).resolve().parent / "examples"
             records = load_records(examples / "aula.22000")
